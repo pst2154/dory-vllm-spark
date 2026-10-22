@@ -3,7 +3,8 @@
 #   huggingface-cli download nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4 --local-dir ~/models/Dory1.0-4B-NVFP4
 #   ./run.sh 8000
 # Env: IMAGE, MODEL_DIR, LOOPS (default loops for requests without "loops": 2), MAX_LOOPS (4), SPEC_KMAX (8; 0 = off),
-#      ATTN (FLASHINFER), MAX_LEN (32768), GPU_UTIL (0.40), MAX_SEQS (128).
+#      SPEC_SCHEDULE ([[1,2,8],[3,4,5],[5,1000000,0]]), FP4_PREFILL (1; 0 = off), ATTN (FLASHINFER),
+#      MAX_LEN (32768), GPU_UTIL (0.40), MAX_SEQS (128).
 set -euo pipefail
 PORT=${1:-8000}
 IMAGE=${IMAGE:-ghcr.io/pst2154/dory-vllm:slim-rc7-loops-speck-kern-arm64}

@@ -47,6 +47,31 @@ Its defaults:
 | n-gram speculation | 8 drafts at 1-2 running requests, 5 at 3-4, off from 5 |
 | FP4 MLP prefill | On (`FP4_PREFILL=0` to turn it off) |
 
+## Options
+
+Server settings: environment variables for `run.sh`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IMAGE` | `ghcr.io/pst2154/dory-vllm:slim-rc7-loops-speck-kern-arm64` | Serving image |
+| `MODEL_DIR` | `~/models/Dory1.0-4B-NVFP4` | Local model directory |
+| `LOOPS` | `2` | Loop count for requests that don't send `"loops"` |
+| `MAX_LOOPS` | `4` | Highest loop count a request may ask for |
+| `SPEC_KMAX` | `8` | Maximum n-gram drafts per step; `0` turns speculation off |
+| `SPEC_SCHEDULE` | `[[1,2,8],[3,4,5],[5,1000000,0]]` | Drafts by number of running requests, as `[min, max, drafts]` |
+| `FP4_PREFILL` | `1` | FP4 tensor-core MLP prefill; `0` turns it off |
+| `ATTN` | `FLASHINFER` | Attention backend (`TRITON_ATTN` also works) |
+| `MAX_LEN` | `32768` | Maximum context length |
+| `GPU_UTIL` | `0.40` | vLLM `--gpu-memory-utilization`, a share of unified memory |
+| `MAX_SEQS` | `128` | Maximum concurrent sequences |
+
+Per-request fields, sent in the chat-completions body:
+
+| Field | Values | Meaning |
+|---|---|---|
+| `loops` | 1–4 | Loop count for this request, with no restart |
+| `spec_k` | 0–8 | Cap on this request's n-gram drafts; the schedule above still applies |
+
 ## Benchmarks (llama-benchy 0.4.0, one GB10)
 
 Spark Arena v2 profile (pp2048, tg128, concurrency 1/2/5/10, prefix caching, 3 runs), tok/s:
