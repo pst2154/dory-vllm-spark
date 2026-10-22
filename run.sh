@@ -3,7 +3,7 @@
 #   huggingface-cli download nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4 --local-dir ~/models/Dory1.0-4B-NVFP4
 #   ./run.sh 8000
 # Env: IMAGE, MODEL_DIR, LOOPS (default loops for requests without "loops": 2), MAX_LOOPS (4), SPEC_KMAX (8; 0 = off),
-#      SPEC_SCHEDULE ([[1,2,8],[3,4,5],[5,1000000,0]]), FP4_PREFILL (0; 1 = on: ~1.5x prefill, lowers accuracy), FP8_PREFILL (0; 1 = FP8 W8A8 MLP prefill: ~1.33x prefill),
+#      SPEC_SCHEDULE ([[1,2,8],[3,4,5],[5,1000000,0]]), FP4_PREFILL (0; 1 = on: ~1.5x prefill, lowers accuracy), FP8_PREFILL (0; 1 = FP8 W8A8 MLP prefill: ~1.33x prefill, slightly lower accuracy),
 #      MIXED_LOOPS (single; grouped = one pass per count, slower; both exact),
 #      LM_HEAD_PAD (1: one-request decode uses the two-request GEMM, +3-7%; 0 = stock path), ATTN (FLASHINFER),
 #      MAX_LEN (32768), GPU_UTIL (0.40), MAX_SEQS (128).
