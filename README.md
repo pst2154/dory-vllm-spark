@@ -17,6 +17,9 @@ It adds to the Dory model code of vLLM PR [#60149](https://github.com/vllm-proje
   - A faster single-request output layer.
   - Optional FP4 tensor-core MLP prefill (`FP4_PREFILL=1`): about 1.5x faster prefill, but it quantizes MLP
     activations to FP4 and lowers accuracy (ARC-Challenge 70.4 → 65.2), so it is off by default.
+  - Optional FP8 tensor-core MLP prefill (`FP8_PREFILL=1`): W8A8 FP8 GEMMs for the MLP on prefill-sized steps,
+    about 1.33x faster prefill. Measured at 2 loops: ARC-Challenge 74.7 and ARC-Easy 77.6 (default path 70.4 / 71.9),
+    MMLU 65.74 (65.72). Off by default.
 
 Upstreaming is tracked in vLLM draft PRs linked from #60149.
 
@@ -48,6 +51,7 @@ Its defaults:
 | Concurrent sequences | 128 |
 | n-gram speculation | 8 drafts at 1-2 running requests, 5 at 3-4, off from 5 |
 | FP4 MLP prefill | Off (`FP4_PREFILL=1` to turn it on; lowers accuracy) |
+| FP8 MLP prefill | Off (`FP8_PREFILL=1` to turn it on) |
 
 ## Options
 
@@ -62,6 +66,7 @@ Server settings: environment variables for `run.sh`.
 | `SPEC_KMAX` | `8` | Maximum n-gram drafts per step; `0` turns speculation off |
 | `SPEC_SCHEDULE` | `[[1,2,8],[3,4,5],[5,1000000,0]]` | Drafts by number of running requests, as `[min, max, drafts]` |
 | `FP4_PREFILL` | `0` | `1` runs MLP prefill on FP4 tensor cores: about 1.5x faster prefill, lower accuracy (ARC-Challenge 70.4 → 65.2) |
+| `FP8_PREFILL` | `0` | `1` runs MLP prefill (steps of 128+ tokens) as FP8 W8A8 GEMMs: 1,500-token prefill 286 → 216 ms at 2 loops (1.33x), +2.0 GB; ARC-Challenge 74.7 vs 70.4, MMLU 65.74 vs 65.72. Takes precedence over `FP4_PREFILL`. Needs an image built from this repo's overlay |
 | `MIXED_SINGLE_PASS` | `0` | Batches that mix loop counts: `0` runs one pass per count (exact: each request matches a fixed-count server); `1` runs one masked pass at the largest count, about 1.9x faster on mixed batches but not bit-exact |
 | `ATTN` | `FLASHINFER` | Attention backend (`TRITON_ATTN` also works) |
 | `MAX_LEN` | `32768` | Maximum context length |

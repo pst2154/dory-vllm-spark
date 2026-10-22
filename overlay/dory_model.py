@@ -674,7 +674,7 @@ class DoryForCausalLM(nn.Module):
             self._check_weight_shape(name, w, shape)
             getattr(param, "weight_loader", default_weight_loader)(param, w)
             loaded.add(name)
-        if os.environ.get("DORY_FP4_PREFILL") == "1":
+        if os.environ.get("DORY_FP4_PREFILL") == "1" or os.environ.get("DORY_FP8_PREFILL") == "1":
             _install_fp4_prefill(self)
         return loaded
 
@@ -700,6 +700,16 @@ class DoryForCausalLM(nn.Module):
 # weights (+1.1 GB; all linears +1.9 GB).
 # Activation global scale is static and needs no calibration: every Dory linear input is
 # a justnorm'd (unit-norm) vector, so |x| <= 1 (layer 0: the embedding table's max |x|).
+# Measured on ARC prompts: MLP input absmax <= 0.99, no block scale clips or underflows;
+# the accuracy loss (ARC-Challenge 70.4 -> 65.2) is FP4 activation rounding itself
+# (~8-9% relative error per linear input), so a dynamic scale does not fix it.
+#
+# DORY_FP8_PREFILL=1 (opt-in, takes precedence): the same MLP linears run W8A8 FP8 GEMMs
+# (CUTLASS) at >= DORY_FP4_MIN_TOKENS tokens: weights = the checkpoint's NVFP4 weights
+# dequantized and requantized to FP8 per output channel, activations FP8 per token
+# (~2.4% relative error). GB10, 1,500-token prefill, 2 loops: 286 -> 216 ms (1.33x);
+# ARC-Challenge 74.7 / ARC-Easy 77.6 vs Marlin 70.4 / 71.9, MMLU 65.74 vs 65.72.
+# Costs an FP8 copy of the MLP weights (+2.0 GB).
 _FP4_LAYERS: dict = {}
 _FP4_AMAX_HEADROOM = 1.125
 
@@ -709,6 +719,9 @@ def _dory_fp4_linear_impl(x: torch.Tensor, layer_name: str) -> torch.Tensor:
     if x.shape[0] >= layer._dory_fp4_min:
         from vllm import _custom_ops as ops
 
+        if hasattr(layer, "_dory_w8t"):
+            xq, xs = ops.scaled_fp8_quant(x, use_per_token_if_dynamic=True)
+            return ops.cutlass_scaled_mm(xq, layer._dory_w8t, xs, layer._dory_w8s, x.dtype)
         xq, xs = ops.scaled_fp4_quant(x, layer._dory_a_gsi)
         return ops.cutlass_scaled_fp4_mm(
             xq, layer._dory_w4, xs, layer._dory_w4_sf, layer._dory_alpha, x.dtype
@@ -742,7 +755,7 @@ def _register_fp4_op():
 def _dory_fp4_apply(self, layer, x, bias=None):
     """NVFP4 linear apply through the dory_fp4_linear custom op (Marlin below the
     token threshold, FP4 tensor cores at/above it)."""
-    if not hasattr(layer, "_dory_w4"):
+    if getattr(layer, "_dory_name", None) not in _FP4_LAYERS:
         return layer._dory_orig_apply(layer, x, bias)
     shape = x.shape
     out = torch.ops.vllm.dory_fp4_linear(x.reshape(-1, shape[-1]), layer._dory_name)
@@ -752,6 +765,21 @@ def _dory_fp4_apply(self, layer, x, bias=None):
 
 
 _HYBRID_CLS: dict = {}
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+def _fp8_weight(mod, gs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Serialized NVFP4 weight (uint8 [N, K/2], two e2m1 per byte, low nibble first;
+    e4m3 block scales [N, K/16]; global scale gs) -> FP8 [K, N] (column-major view)
+    with per-output-channel fp32 scales [N, 1]."""
+    from vllm import _custom_ops as ops
+
+    w = mod.weight.detach()
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=w.device)
+    q = torch.stack([lut[(w & 0xF).long()], lut[(w >> 4).long()]], dim=-1).reshape(w.shape[0], -1)
+    wf = q * mod.weight_scale.detach().float().repeat_interleave(16, dim=1) * gs.float()
+    w8, ws = ops.scaled_fp8_quant(wf.to(torch.bfloat16), use_per_token_if_dynamic=True)
+    return w8.t(), ws.float().contiguous()
 
 
 def _install_fp4_prefill(model: nn.Module) -> None:
@@ -761,6 +789,7 @@ def _install_fp4_prefill(model: nn.Module) -> None:
     )
 
     min_tokens = int(os.environ.get("DORY_FP4_MIN_TOKENS", "128"))
+    fp8 = os.environ.get("DORY_FP8_PREFILL") == "1"
     emb_amax = float(model.backbone.embeddings.weight.detach().abs().max().float())
     first = model.config.n_input_layers and "backbone.layers.0.mixer."
     _register_fp4_op()
@@ -780,11 +809,14 @@ def _install_fp4_prefill(model: nn.Module) -> None:
         bound = emb_amax if (first and name.startswith(first) and
                              not name.endswith(("o_proj", "down_proj"))) else 1.0
         bound *= _FP4_AMAX_HEADROOM
-        mod._dory_w4 = mod.weight.detach().clone()
-        mod._dory_w4_sf = swizzle_blockscale(mod.weight_scale.detach().clone())
-        mod._dory_a_gsi = torch.tensor([448.0 * 6.0 / bound], dtype=torch.float32,
-                                       device=gs.device)
-        mod._dory_alpha = (gs[:1] * (bound / (448.0 * 6.0))).to(torch.float32)
+        if fp8:
+            mod._dory_w8t, mod._dory_w8s = _fp8_weight(mod, gs[:1])
+        else:
+            mod._dory_w4 = mod.weight.detach().clone()
+            mod._dory_w4_sf = swizzle_blockscale(mod.weight_scale.detach().clone())
+            mod._dory_a_gsi = torch.tensor([448.0 * 6.0 / bound], dtype=torch.float32,
+                                           device=gs.device)
+            mod._dory_alpha = (gs[:1] * (bound / (448.0 * 6.0))).to(torch.float32)
         mod._dory_fp4_min = min_tokens
         qm = mod.quant_method
         base = type(qm)
@@ -799,10 +831,11 @@ def _install_fp4_prefill(model: nn.Module) -> None:
         qm.__class__ = _HYBRID_CLS[base]
         _FP4_LAYERS[name] = mod
         n_layers += 1
-        nbytes += mod._dory_w4.numel() + mod._dory_w4_sf.numel()
-    logger.info("dory fp4 prefill: %d linears use FP4 tensor cores for >= %d tokens "
-                "(+%.2f GB weights, embedding amax %.3f)", n_layers, min_tokens,
-                nbytes / 1e9, emb_amax)
+        nbytes += (mod._dory_w8t.numel() if fp8 else
+                   mod._dory_w4.numel() + mod._dory_w4_sf.numel())
+    logger.info("dory %s prefill: %d linears use %s tensor cores for >= %d tokens "
+                "(+%.2f GB weights, embedding amax %.3f)", "fp8" if fp8 else "fp4", n_layers,
+                "FP8 W8A8" if fp8 else "FP4", min_tokens, nbytes / 1e9, emb_amax)
 
 
 # --------------------------------------------------------------- lazy per-loop KV
