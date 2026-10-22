@@ -14,7 +14,8 @@ It adds to the Dory model code of vLLM PR [#60149](https://github.com/vllm-proje
   - The per-loop KV cache is sized to each request's own loop count, so 1-2 loop traffic doesn't pay for the 4-loop
     reservation.
   - A faster single-request output layer.
-  - FP4 tensor-core MLP prefill, on by default (about 1.5x faster prefill, no measured quality loss).
+  - Optional FP4 tensor-core MLP prefill (`FP4_PREFILL=1`): about 1.5x faster prefill, but it quantizes MLP
+    activations to FP4 and lowers accuracy (ARC-Challenge 70.4 → 65.2), so it is off by default.
 
 Upstreaming is tracked in vLLM draft PRs linked from #60149.
 
@@ -45,7 +46,7 @@ Its defaults:
 | Attention backend | FlashInfer |
 | Concurrent sequences | 128 |
 | n-gram speculation | 8 drafts at 1-2 running requests, 5 at 3-4, off from 5 |
-| FP4 MLP prefill | On (`FP4_PREFILL=0` to turn it off) |
+| FP4 MLP prefill | Off (`FP4_PREFILL=1` to turn it on; lowers accuracy) |
 
 ## Options
 
@@ -59,7 +60,7 @@ Server settings: environment variables for `run.sh`.
 | `MAX_LOOPS` | `4` | Highest loop count a request may ask for |
 | `SPEC_KMAX` | `8` | Maximum n-gram drafts per step; `0` turns speculation off |
 | `SPEC_SCHEDULE` | `[[1,2,8],[3,4,5],[5,1000000,0]]` | Drafts by number of running requests, as `[min, max, drafts]` |
-| `FP4_PREFILL` | `1` | FP4 tensor-core MLP prefill; `0` turns it off |
+| `FP4_PREFILL` | `0` | `1` runs MLP prefill on FP4 tensor cores: about 1.5x faster prefill, lower accuracy (ARC-Challenge 70.4 → 65.2) |
 | `ATTN` | `FLASHINFER` | Attention backend (`TRITON_ATTN` also works) |
 | `MAX_LEN` | `32768` | Maximum context length |
 | `GPU_UTIL` | `0.40` | vLLM `--gpu-memory-utilization`, a share of unified memory |
@@ -85,7 +86,7 @@ Spark Arena v2 profile (pp2048, tg128, concurrency 1/2/5/10, prefix caching, 3 r
 
 The first three rows used the Triton attention backend with speculation up to 12 concurrent requests. Speculating only
 at low concurrency keeps the single-stream gain and matches no-speculation throughput under load. The `run.sh` row
-was measured before FP4 MLP prefill became the default, which speeds up prefill by about 1.5x.
+is the current default (FP4 MLP prefill off).
 
 Full tables are in [`benchmarks/`](benchmarks):
 
