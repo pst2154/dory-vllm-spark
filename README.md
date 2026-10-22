@@ -10,11 +10,13 @@ It adds to the Dory model code of vLLM PR [#60149](https://github.com/vllm-proje
 - **Per-request speculation cap**: `"spec_k": 0-8` caps n-gram (`ngram_gpu`) drafts for that request. A batch-size
   schedule speculates only at low concurrency.
 - **GB10 kernel overlay**:
-  - Batches that mix loop counts run one pass per count by default, so each request matches a fixed-count server.
-    Opt-in `MIXED_SINGLE_PASS=1` runs them in one masked pass instead: faster on mixed batches, but not bit-exact.
+  - Batches that mix loop counts run in one pass at the largest count; each request still matches a server started
+    with its own fixed count, bit for bit (batch-invariant mode). `MIXED_LOOPS=grouped` runs one pass per count instead.
   - The per-loop KV cache is sized to each request's own loop count, so 1-2 loop traffic doesn't pay for the 4-loop
     reservation.
-  - A faster single-request output layer.
+  - Faster single-request output layer: one-request decode uses the same GEMM as two-request batches (cuBLAS picks a
+    slow GEMV for one row on GB10); +3-7% single-request decode; output equals what the request gets in a batch of two.
+    `LM_HEAD_PAD=0` turns it off.
   - Optional FP4 tensor-core MLP prefill (`FP4_PREFILL=1`): about 1.5x faster prefill, but it quantizes MLP
     activations to FP4 and lowers accuracy (ARC-Challenge 70.4 → 65.2), so it is off by default.
   - Optional FP8 tensor-core MLP prefill (`FP8_PREFILL=1`): W8A8 FP8 GEMMs for the MLP on prefill-sized steps,
@@ -67,7 +69,8 @@ Server settings: environment variables for `run.sh`.
 | `SPEC_SCHEDULE` | `[[1,2,8],[3,4,5],[5,1000000,0]]` | Drafts by number of running requests, as `[min, max, drafts]` |
 | `FP4_PREFILL` | `0` | `1` runs MLP prefill on FP4 tensor cores: about 1.5x faster prefill, lower accuracy (ARC-Challenge 70.4 → 65.2) |
 | `FP8_PREFILL` | `0` | `1` runs MLP prefill (steps of 128+ tokens) as FP8 W8A8 GEMMs: 1,500-token prefill 286 → 216 ms at 2 loops (1.33x), +2.0 GB; ARC-Challenge 74.7 vs 70.4, MMLU 65.74 vs 65.72. Takes precedence over `FP4_PREFILL`. Needs an image built from this repo's overlay |
-| `MIXED_SINGLE_PASS` | `0` | Batches that mix loop counts: `0` runs one pass per count (exact: each request matches a fixed-count server); `1` runs one masked pass at the largest count, about 1.9x faster on mixed batches but not bit-exact |
+| `MIXED_LOOPS` | `single` | Batches that mix loop counts: `single` runs one pass at the largest count; `grouped` runs one pass per count (slower). Both are exact: each request matches a fixed-count server |
+| `LM_HEAD_PAD` | `1` | One-request decode uses the same output-layer GEMM as two-request batches (cuBLAS picks a slow GEMV for one row on GB10): +3-7% single-request decode; output equals what the request gets in a batch of two. `0` turns it off |
 | `ATTN` | `FLASHINFER` | Attention backend (`TRITON_ATTN` also works) |
 | `MAX_LEN` | `32768` | Maximum context length |
 | `GPU_UTIL` | `0.40` | vLLM `--gpu-memory-utilization`, a share of unified memory |
@@ -93,7 +96,7 @@ Spark Arena v2 profile (pp2048, tg128, concurrency 1/2/5/10, prefix caching, 3 r
 
 The first three rows used the Triton attention backend with speculation up to 12 concurrent requests. Speculating only
 at low concurrency keeps the single-stream gain and matches no-speculation throughput under load. The `run.sh` row
-is the current default (FP4 MLP prefill off).
+used the `run.sh` defaults (FP4 MLP prefill off).
 
 Full tables are in [`benchmarks/`](benchmarks):
 

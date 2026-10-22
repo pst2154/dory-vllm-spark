@@ -1,6 +1,6 @@
 # Dory1.0-4B serving image on the public vLLM nightly (fe4df3df) + the Dory model code of vLLM PR #60149 as a
 # pure-Python overlay, plus per-request loop counts ("loops"), per-request n-gram draft caps ("spec_k") and the
-# GB10 kernel overlay (exact mixed loop counts, opt-in single pass; per-request per-loop KV sizing; opt-in FP4 MLP prefill).
+# GB10 kernel overlay (exact single-pass mixed loop counts; per-request per-loop KV sizing; opt-in FP4 MLP prefill, lm_head pad).
 #   docker build -t dory-vllm:loops-speck-kern .
 # Dockerfile.slim layers the same overlay on the Nemotron Deciffusion slim serving image instead (the published
 # ghcr.io image); the Dory path is identical in both.

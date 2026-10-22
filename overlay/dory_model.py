@@ -38,13 +38,22 @@ from .utils import maybe_prefix
 
 logger = init_logger(__name__)
 EPS = 1e-6
-_LMHEAD_PAD = os.environ.get("DORY_LMHEAD_PAD", "1") == "1"
+# DORY_LM_HEAD_PAD (1 = default): lm_head GEMMs of 1-3 rows run padded to 8 rows, so a
+# one-request decode uses the same GEMM as a two-request batch (cuBLAS picks a slow GEMV for
+# one row on GB10): +3-7% single-request decode. 0 = the stock path.
+_LMHEAD_PAD = os.environ.get("DORY_LM_HEAD_PAD", "1") == "1"
 _LAZY_LOOP_KV = os.environ.get("DORY_LAZY_LOOP_KV", "1") == "1"
-# Mixed loop counts in one batch. 0 (default): one pass per distinct count, bit-exact
-# vs each request alone. 1: one masked pass at the largest count (~1.9x on mixed
-# batches), but not bit-exact: torch.compile fuses the mask into the norm reductions,
-# so mixed-batch outputs can drift from the fixed-count graphs after some tokens.
-_MIXED_SINGLE_PASS = os.environ.get("DORY_MIXED_SINGLE_PASS", "0") == "1"
+# Batches that mix loop counts (both modes are exact: each request matches a server
+# started with n_recurrent_loops equal to its count, in batch-invariant mode).
+#   single (default): one pass at the largest count in the batch; loop i only updates
+#     the tokens whose count is > i. Costs the largest count.
+#   grouped: one pass per distinct count. Costs the sum of the counts.
+_MIXED_LOOPS = os.environ.get("DORY_MIXED_LOOPS", "single")
+if _MIXED_LOOPS not in ("single", "grouped"):
+    raise ValueError(f"DORY_MIXED_LOOPS={_MIXED_LOOPS!r}: expected 'single' or 'grouped'")
+if "DORY_MIXED_SINGLE_PASS" in os.environ:
+    logger.warning("DORY_MIXED_SINGLE_PASS is ignored (the inexact masked pass is gone); "
+                   "DORY_MIXED_LOOPS=%s", _MIXED_LOOPS)
 
 
 def justnorm(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -61,6 +70,35 @@ def slerp_norm(a: torch.Tensor, b: torch.Tensor, lr: torch.Tensor) -> torch.Tens
 
 def slerp_alpha(a, b, alpha, alpha_scale):
     return slerp_norm(a, b, (alpha.float() * alpha_scale).abs())
+
+
+def _dory_loop_state(
+    new: torch.Tensor, old: torch.Tensor, loop_counts: torch.Tensor, loop_idx: int
+) -> torch.Tensor:
+    # Tokens of requests with <= loop_idx loops keep their state.
+    keep = loop_counts[: new.shape[0]] <= loop_idx
+    return torch.where(keep.unsqueeze(-1), old, new)
+
+
+def _dory_loop_state_fake(
+    new: torch.Tensor, old: torch.Tensor, loop_counts: torch.Tensor, loop_idx: int
+) -> torch.Tensor:
+    return torch.empty_like(new)
+
+
+# Opaque to torch.compile, so that Inductor fuses the code around it the same way in
+# every loop-count graph: a token then rounds identically whether its batch runs its own
+# count or a larger one. With the select inlined, Inductor fused it into the neighbouring
+# norm reductions and mixed batches drifted after a few dozen tokens.
+if not hasattr(torch.ops.vllm, "dory_loop_state"):
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    direct_register_custom_op(
+        op_name="dory_loop_state",
+        op_func=_dory_loop_state,
+        fake_impl=_dory_loop_state_fake,
+        dispatch_key="CompositeExplicitAutograd",
+    )
 
 
 class DoryAttention(nn.Module):
@@ -269,7 +307,7 @@ class DoryBackbone(nn.Module):
             ]
         )
 
-    def run(self, input_ids, positions, inputs_embeds, num_loops, loop_counts=None):
+    def run(self, input_ids, positions, inputs_embeds, num_loops, loop_counts):
         h = inputs_embeds if inputs_embeds is not None else self.embeddings(input_ids)
         c = self.config
         n_in, n_rec = c.n_input_layers, c.n_recurrent_layers
@@ -284,13 +322,11 @@ class DoryBackbone(nn.Module):
             h = combined
             for layer in self.layers[n_in : n_in + n_rec]:
                 h = layer(positions, h, loop_idx=i)
-            if loop_counts is None or i == 0:
-                state = justnorm(h)
-            else:
-                # mixed batch: a token whose request asked for <= i loops keeps its state
-                # (its loop-i compute is discarded; its loop-i KV slots are never read,
-                # since its own count never attends loop i and blocks are salted per count)
-                state = torch.where((loop_counts > i).unsqueeze(-1), justnorm(h), state)
+            # A token whose request asked for <= i loops keeps its state (its loop-i
+            # compute is discarded; its loop-i KV slots are never read, since its own
+            # count never attends loop i and blocks are salted per count). Every graph
+            # runs this op, uniform batches included, so all graphs fuse alike.
+            state = torch.ops.vllm.dory_loop_state(justnorm(h), state, loop_counts, i)
 
         h = state
         for layer in self.layers[n_in + n_rec :]:
@@ -307,30 +343,11 @@ class _DoryLoopVariantBase(nn.Module):
 
 
 def _make_loop_variant(num_loops: int):
-    """A torch.compile unit running `num_loops` loops: the same graph as a server
-    started with n_recurrent_loops=num_loops. Each variant needs its own forward
-    qualname: vLLM keys the AOT compile cache on the forward's qualname."""
+    """A torch.compile unit running `num_loops` loops, in which loop i only updates
+    tokens whose count is > i: for a uniform batch, the graph of a server started with
+    n_recurrent_loops=num_loops. Each variant needs its own forward qualname: vLLM keys
+    the AOT compile cache on the forward's qualname."""
     name = f"DoryLoopVariantL{num_loops}"
-
-    def forward(
-        self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.core.run(input_ids, positions, inputs_embeds, self.num_loops)
-
-    forward.__qualname__ = f"{name}.forward"
-    cls = type(name, (_DoryLoopVariantBase,), {"forward": forward, "__qualname__": name})
-    return support_torch_compile(cls)
-
-
-def _make_masked_loop_variant(num_loops: int):
-    """Mixed batches: ONE pass of `num_loops` (= the largest count in the batch) loops;
-    loop i only updates the tokens whose request asked for more than i loops. Cost =
-    the largest count, not the sum of the counts (the old grouped passes ran the input
-    and output layers once per count and every count's loops)."""
-    name = f"DoryMaskedLoopVariantL{num_loops}"
 
     def forward(
         self,
@@ -349,18 +366,17 @@ def _make_masked_loop_variant(num_loops: int):
 # --------------------------------------------------------------- per-request loops
 # The model runner (V2) hands each request's SamplingParams.extra_args["loops"] to
 # DoryModelState, which writes a per-token loop-count buffer and sets the step key.
-# One count n in the batch: key (n,), the plain n-loop graph (the same graph as a
-# server started with n loops). Several counts:
-# - default (DORY_MIXED_SINGLE_PASS=0): key = the distinct counts, one pass per count.
-#   During a pass only that count's tokens write KV (the others' slots are -1, like
-#   padding) and each token keeps the hidden state of its own count's pass: bit-exact
-#   vs running alone (deterministic mode); the step costs the sum of the counts.
-# - DORY_MIXED_SINGLE_PASS=1: key (0, m), largest m, ONE masked m-loop pass: loop i
-#   only updates tokens whose count is > i. The step costs m loops, but it is not
-#   bit-exact (the mask changes the compiled norm kernels). A request's per-loop caches
-# above its count are never read by it (and only get scratch writes from masked
-# loops); its blocks are only reused by requests with the same count (prefix-cache
-# salt per count).
+# One count n in the batch: key (n,), the n-loop graph (the same graph as a server
+# started with n loops). Several counts:
+# - DORY_MIXED_LOOPS=single (default): key (m,), largest m: the m-loop graph, in which
+#   loop i only updates tokens whose count is > i (opaque op dory_loop_state). The step
+#   costs m loops. A request's per-loop caches above its count are never read by it (and
+#   only get scratch writes from these loops); its blocks are only reused by requests
+#   with the same count (prefix-cache salt per count).
+# - DORY_MIXED_LOOPS=grouped: key = the distinct counts, one pass per count. During a
+#   pass only that count's tokens write KV (the others' slots are -1, like padding) and
+#   each token keeps the hidden state of its own count's pass. Costs the sum of counts.
+# Both are exact vs a fixed-count server (batch-invariant mode).
 # FULL CUDA graphs are captured once per step key (CudaGraphManager patch below).
 _ACTIVE: "weakref.ref[DoryForCausalLM] | None" = None
 
@@ -447,13 +463,15 @@ def _dory_model_state_cls():
             n = input_batch.num_tokens_after_padding
             loops = self.req_loops[input_batch.idx_mapping_np]
             key = tuple(int(x) for x in np.unique(loops))
-            if len(key) > 1:
-                if _MIXED_SINGLE_PASS:
-                    key = (0, key[-1])
+            if len(key) == 1:
+                self.loop_counts[:n].fill_(key[0])
+            else:
                 tok = np.full(n, key[-1], dtype=np.int32)       # padding rows: any count
                 num = input_batch.num_scheduled_tokens[: input_batch.num_reqs]
                 tok[: int(num.sum())] = np.repeat(loops, num)
                 async_tensor_h2d(tok, out=self.loop_counts[:n])
+                if _MIXED_LOOPS == "single":
+                    key = key[-1:]
             self.model.step_key = key
             out["loop_counts"] = self.loop_counts[:n]
             if self.debug:
@@ -499,13 +517,11 @@ class DoryForCausalLM(nn.Module):
         default, max_loops = config.n_recurrent_loops, self.backbone.num_loops
         _DEFAULT_LOOPS["n"] = default
         counts = range(1, max_loops + 1)
-        # step keys: (n,) = every token runs n loops (plain graph); (0, m) = mixed
-        # counts, largest m (one masked m-loop graph)
-        # counts, largest m (one masked m-loop graph); or, by default, the distinct
-        # counts (one pass per count, replaying the single-count graphs)
-        if _MIXED_SINGLE_PASS:
-            mixed_keys = [(0, m) for m in counts if m > 1]
-        else:
+        # step keys: (m,) = the m-loop graph (uniform batch of m, or, by default, a mixed
+        # batch of largest count m); grouped mode adds the sets of distinct counts (one pass
+        # per count, replaying the single-count graphs)
+        mixed_keys = []
+        if _MIXED_LOOPS == "grouped":
             mixed_keys = [k for r in range(2, max_loops + 1) for k in combinations(counts, r)]
         self.step_keys = [(n,) for n in counts] + mixed_keys
         self.default_key = (default,)
@@ -522,18 +538,6 @@ class DoryForCausalLM(nn.Module):
                     num_loops=n,
                 )
         self.loop_variants = nn.ModuleDict(variants)
-        masked = {}
-        for n in counts if _MIXED_SINGLE_PASS else ():
-            if n == 1:
-                continue
-            with set_model_tag(f"dory_masked{n}"):
-                masked[str(n)] = _make_masked_loop_variant(n)(
-                    vllm_config=vllm_config,
-                    prefix=maybe_prefix(prefix, f"masked{n}"),
-                    core=self.backbone,
-                    num_loops=n,
-                )
-        self.masked_variants = nn.ModuleDict(masked)
         global _ACTIVE
         _ACTIVE = weakref.ref(self)
         _patch_cudagraph_manager()
@@ -544,6 +548,7 @@ class DoryForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.lm_head.logit_scale = nn.Parameter(torch.empty(config.vocab_size))
+        logger.info("dory lm_head pad (DORY_LM_HEAD_PAD): %s", "on" if _LMHEAD_PAD else "off")
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
     def embed_input_ids(self, input_ids):
@@ -560,7 +565,12 @@ class DoryForCausalLM(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         loop_counts: torch.Tensor | None = None,
     ):
-        key = self.step_key if loop_counts is not None else self.default_key
+        if loop_counts is None:  # Model Runner V1: every request runs the default count
+            key = self.default_key
+            loop_counts = torch.full((positions.shape[-1],), key[0], dtype=torch.int32,
+                                     device=positions.device)
+        else:
+            key = self.step_key
         if not self._all_compiled:
             # First forward = the engine's profiling run: compile every variant here, on
             # the same inputs. A variant compiled later (first called during CUDA graph
@@ -569,18 +579,10 @@ class DoryForCausalLM(nn.Module):
             self._all_compiled = True
             for n in self.loop_variants:
                 if key != (int(n),):
-                    self.loop_variants[n](input_ids, positions, inputs_embeds)
-            lc = loop_counts
-            if lc is None:
-                lc = torch.ones(positions.shape[-1], dtype=torch.int32, device=positions.device)
-            for n in self.masked_variants:
-                if key != (0, int(n)):
-                    self.masked_variants[n](input_ids, positions, lc, inputs_embeds)
+                    self.loop_variants[n](input_ids, positions, loop_counts, inputs_embeds)
         if len(key) == 1:
-            return self.loop_variants[str(key[0])](input_ids, positions, inputs_embeds)
-        if key[0] != 0:
-            return self._grouped_passes(key, input_ids, positions, inputs_embeds, loop_counts)
-        return self.masked_variants[str(key[-1])](input_ids, positions, loop_counts, inputs_embeds)
+            return self.loop_variants[str(key[0])](input_ids, positions, loop_counts, inputs_embeds)
+        return self._grouped_passes(key, input_ids, positions, inputs_embeds, loop_counts)
 
     def _grouped_passes(self, key, input_ids, positions, inputs_embeds, loop_counts):
         # Mixed batch, exact: one pass per loop count. During a pass only that count's
@@ -600,7 +602,7 @@ class DoryForCausalLM(nn.Module):
             for t, o in zip(maps, saved):
                 k = min(t.shape[0], sel.shape[0])
                 t[:k].copy_(torch.where(sel[:k], o[:k], torch.full_like(o[:k], -1)))
-            h = self.loop_variants[str(n)](input_ids, positions, inputs_embeds)
+            h = self.loop_variants[str(n)](input_ids, positions, loop_counts, inputs_embeds)
             out = h.clone() if out is None else torch.where(sel.unsqueeze(-1), h, out)
         for t, o in zip(maps, saved):
             t.copy_(o)
@@ -846,7 +848,7 @@ def _install_fp4_prefill(model: nn.Module) -> None:
 # a FullAttention / SlidingWindow spec subclass carrying min_loops=k). Its manager
 # gives a request whose loop count is < k only null blocks: no pool memory, no prefix
 # cache entries; the worker's block table rows point at the null block, which only
-# the discarded rows of a mixed-batch masked pass ever touch. Requests that run k
+# the discarded rows of a mixed-batch single pass ever touch. Requests that run k
 # loops allocate and cache exactly as before. The scheduler learns a request's loop
 # count from SamplingParams.extra_args["loops"] (dory_request_loops validated it).
 _REQ_LOOPS: dict = {}
