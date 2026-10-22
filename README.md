@@ -14,7 +14,7 @@ It adds to the Dory model code of vLLM PR [#60149](https://github.com/vllm-proje
   - The per-loop KV cache is sized to each request's own loop count, so 1-2 loop traffic doesn't pay for the 4-loop
     reservation.
   - A faster single-request output layer.
-  - Optional FP4 tensor-core MLP prefill (`DORY_FP4_PREFILL=1`, about 1.5x faster prefill).
+  - FP4 tensor-core MLP prefill, on by default (about 1.5x faster prefill, no measured quality loss).
 
 Upstreaming is tracked in vLLM draft PRs linked from #60149.
 
@@ -45,6 +45,7 @@ Its defaults:
 | Attention backend | FlashInfer |
 | Concurrent sequences | 128 |
 | n-gram speculation | 8 drafts at 1-2 running requests, 5 at 3-4, off from 5 |
+| FP4 MLP prefill | On (`FP4_PREFILL=0` to turn it off) |
 
 ## Benchmarks (llama-benchy 0.4.0, one GB10)
 
@@ -55,9 +56,11 @@ Spark Arena v2 profile (pp2048, tg128, concurrency 1/2/5/10, prefix caching, 3 r
 | 1 loop, no speculation | 76.3 | 275 / 580 | 7,307 |
 | 1 loop, n-gram speculation | 122 (±68, prompt-dependent) | 264 / 665 | 7,297 |
 | 2 loops, n-gram speculation | 114 (±48) | 179 / 488 | 4,682 |
+| **1 loop, `run.sh` defaults** (FlashInfer, speculation at 1-4 running requests) | **116 (±60)** | **274 / 580** | 7,442 |
 
-Those runs used the Triton attention backend with speculation up to 12 concurrent requests. `run.sh` uses FlashInfer
-and speculates only at low concurrency; results for that setup will be added.
+The first three rows used the Triton attention backend with speculation up to 12 concurrent requests. Speculating only
+at low concurrency keeps the single-stream gain and matches no-speculation throughput under load. The `run.sh` row
+was measured before FP4 MLP prefill became the default, which speeds up prefill by about 1.5x.
 
 Full tables are in [`benchmarks/`](benchmarks):
 
