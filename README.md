@@ -10,7 +10,8 @@ It adds to the Dory model code of vLLM PR [#60149](https://github.com/vllm-proje
 - **Per-request speculation cap**: `"spec_k": 0-8` caps n-gram (`ngram_gpu`) drafts for that request. A batch-size
   schedule speculates only at low concurrency.
 - **GB10 kernel overlay**:
-  - Mixed loop counts run in one pass, 1.9x faster on a 1/2/4 mix.
+  - Batches that mix loop counts run one pass per count by default, so each request matches a fixed-count server.
+    Opt-in `MIXED_SINGLE_PASS=1` runs them in one masked pass instead: faster on mixed batches, but not bit-exact.
   - The per-loop KV cache is sized to each request's own loop count, so 1-2 loop traffic doesn't pay for the 4-loop
     reservation.
   - A faster single-request output layer.
@@ -61,6 +62,7 @@ Server settings: environment variables for `run.sh`.
 | `SPEC_KMAX` | `8` | Maximum n-gram drafts per step; `0` turns speculation off |
 | `SPEC_SCHEDULE` | `[[1,2,8],[3,4,5],[5,1000000,0]]` | Drafts by number of running requests, as `[min, max, drafts]` |
 | `FP4_PREFILL` | `0` | `1` runs MLP prefill on FP4 tensor cores: about 1.5x faster prefill, lower accuracy (ARC-Challenge 70.4 → 65.2) |
+| `MIXED_SINGLE_PASS` | `0` | Batches that mix loop counts: `0` runs one pass per count (exact: each request matches a fixed-count server); `1` runs one masked pass at the largest count, about 1.9x faster on mixed batches but not bit-exact |
 | `ATTN` | `FLASHINFER` | Attention backend (`TRITON_ATTN` also works) |
 | `MAX_LEN` | `32768` | Maximum context length |
 | `GPU_UTIL` | `0.40` | vLLM `--gpu-memory-utilization`, a share of unified memory |

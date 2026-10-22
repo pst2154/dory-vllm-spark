@@ -1,5 +1,5 @@
 # Dory1.0-4B serving image = the Nemotron Deciffusion slim serving image (rc7-candidate, nemotron-deciffusion security-rc7
-# c2ab18b: vLLM nightly fe4df3df + the slim-engine overlay + kernels + Rust frontend + security fixes) + the Dory model
+# 65d3c25: vLLM nightly fe4df3df + the slim-engine overlay + kernels + Rust frontend + security fixes) + the Dory model
 # code of vLLM PR #60149 (head 55076950b6c1) as a pure-Python overlay (overlay/install.sh: model/config files, registry
 # lines, per-request loops + spec_k). One image serves both models:
 #   Deciffusion:  docker run ... <image>                      (entrypoint.sh -> /app/start.sh, as the slim image)
@@ -7,7 +7,7 @@
 # The two overlays touch disjoint hunks (Dory adds lines guarded by model_type == "dory" / request fields "loops",
 # "spec_k"; the Deciffusion overlay's files and hunks are untouched), so the Deciffusion path is bit-identical.
 # Prebuilt: ghcr.io/pst2154/dory-vllm:slim-rc7-loops-speck-kern-arm64 (linux/arm64, DGX Spark / GB10).
-ARG BASE=nemotron-deciffusion:slim-rc7-c2ab18b
+ARG BASE=nemotron-deciffusion:slim-rc7-65d3c25
 FROM ${BASE}
 USER root
 COPY overlay /opt/dory-overlay
